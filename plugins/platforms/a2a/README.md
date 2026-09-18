@@ -53,6 +53,43 @@ and push notification configs (inline or via
 memory — and the reply is returned over A2A. Completed tasks stay queryable
 via `tasks/get`.
 
+## Task access
+
+The default `shared` policy lets admitted peers share tasks within the selected
+agent and tenant. For independent callers, enable peer isolation:
+
+```yaml
+platforms:
+  a2a:
+    enabled: true
+    extra:
+      task_access: peer
+```
+
+`peer` requires `A2A_PEER_TOKENS` and rejects a shared `A2A_BEARER_TOKEN`.
+Only the initiating peer can access a task, its notifications, or its context.
+Rotating a token while keeping the peer name preserves ownership. Context owners
+persist in `a2a_contexts.db`; task records still disappear on restart. Existing
+transcripts without an owner binding remain locally readable but require a new
+context for remote work. Changing to `shared` explicitly removes peer isolation.
+
+Configured outbound peers may supply additional HTTP headers for a proxy:
+
+```yaml
+a2a_agents:
+  reviewer:
+    url: "https://proxy.example/reviewer"
+    auth: {type: bearer, token: "${REVIEWER_TOKEN}"}
+    headers:
+      X-Proxy-Authorization: "Bearer ${PROXY_TOKEN}"
+```
+
+Hermes expands secret references through its existing config loader. Bearer auth
+wins over a conflicting Authorization header. Calls and fan-out use these headers
+for card discovery and task submission; direct URL calls do not inherit them.
+Authenticated card endpoints must stay on the configured origin; redirects to
+another origin are refused. Configure the final endpoint when using a proxy.
+
 ## Security
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1` and refuses to

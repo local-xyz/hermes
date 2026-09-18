@@ -8,7 +8,9 @@ import contextlib
 import json
 import logging
 import os
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
@@ -35,7 +37,8 @@ def _configured_peers() -> dict:
 
 def _peer_from_entry(entry: dict, **extra: Any) -> dict:
     return {"url": entry.get("url", ""), "auth": entry.get("auth", {}) or {},
-            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
+            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
+            "headers": entry.get("headers", {}) or {}, **extra}
 
 
 def _resolve_peer(agent: str) -> Optional[dict]:
@@ -50,9 +53,40 @@ def _auth_header(auth: dict) -> dict:
     return {"Authorization": f"Bearer {auth['token']}"} if auth and auth.get("type") == "bearer" and auth.get("token") else {}
 
 
+def _request_headers(peer: dict) -> dict:
+    configured = peer.get("headers") or {}
+    if not isinstance(configured, dict):
+        raise ValueError("Error: A2A peer headers must be a mapping.")
+    headers = {}
+    for name, value in configured.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise ValueError("Error: invalid A2A peer header configuration.")
+        headers[name.lower()] = value
+    headers.update({name.lower(): value for name, value in _auth_header(peer.get("auth") or {}).items()})
+    if any(not isinstance(value, str) or any(ord(c) < 32 or ord(c) > 126 for c in value)
+           for value in headers.values()):
+        # urllib's validation errors can echo credential values to the model.
+        raise ValueError("Error: invalid A2A peer header configuration.")
+    return headers
+
+
+def _origin(url: str) -> tuple:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Error: invalid A2A peer URL.")
+    return parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _origin(req.full_url) != _origin(newurl):
+            raise ValueError("Error: A2A peer redirected to a different origin.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _http_json(url: str, headers: dict, timeout: int, method: str, data: Optional[bytes] = None) -> dict:
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with urllib.request.build_opener(_SameOriginRedirectHandler()).open(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -97,12 +131,15 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     """One SendMessage to a peer -> (reply_text, context_id, state). Raises urllib errors /
     ValueError for the caller to format; handles redaction, audit, persistence, metrics."""
     base_url = peer.get("url", "")
-    headers = _auth_header(peer.get("auth", {}) or {})
+    headers = _request_headers(peer)
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
     try:
         card = _fetch_card(base_url, headers, min(timeout, 30))  # best-effort, to learn the rpc URL
     except Exception:
         card = None
+    rpc_url = _rpc_url(base_url, card)
+    if headers and _origin(base_url) != _origin(rpc_url):
+        raise ValueError("Error: authenticated A2A interface must use the configured peer origin.")
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
@@ -115,7 +152,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(rpc_url, rpc_body, headers, timeout)
     if "error" in resp:
         raise ValueError(f"Peer '{agent_label}' returned an error: {resp['error'].get('message', resp['error'])}")
     payload = protocol.unwrap_send_message_response(resp.get("result", {}))

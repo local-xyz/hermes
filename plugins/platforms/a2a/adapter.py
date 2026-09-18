@@ -252,9 +252,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         elif handler_name == "_rpc_message_stream":
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
         elif handler_name == "_rpc_tasks_subscribe":
-            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent)
+            adapter._rpc_tasks_subscribe(self, req_id, params, agent=agent, peer=identity)
         else:  # plain JSON task / push-config queries
-            self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
+            self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent, peer=identity))
 
 
 class A2AAdapter(BasePlatformAdapter):
@@ -269,6 +269,11 @@ class A2AAdapter(BasePlatformAdapter):
         # in this fix's PR description: open PR #98937 is actively rewriting this field's None-vs-empty-list
         # semantics.)
         self._security_context = security.A2ASecurityContext.capture()
+        self._task_access = extra.get("task_access", "shared")
+        if self._task_access not in {"shared", "peer"}:
+            raise ValueError("A2A task_access must be 'shared' or 'peer'")
+        if self._task_access == "peer" and (not self._security_context.peer_tokens or self._security_context.bearer_token):
+            raise ValueError("A2A peer task access requires per-peer tokens and no shared bearer token")
         _port_env = _get_scoped_secret("A2A_PORT")
         self.port = int(_port_env or extra.get("port", _DEFAULT_PORT))
         self.host = self._security_context.resolve_bind_host()
@@ -287,6 +292,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._watchdog_stop = threading.Event()
         # Per-adapter protocol state (not module-global).
         self.tasks, self._turns, self._rate_limiter = protocol.TaskStore(), protocol.TurnTracker(), protocol.RateLimiter()
+        self._context_owners = protocol.ContextOwners()
         # Forwarded profile sessions: (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
@@ -531,6 +537,8 @@ class A2AAdapter(BasePlatformAdapter):
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
+        if self._task_access == "peer" and not self._context_owners.claim(context_id, peer, *self._scope_for_agent(agent)):
+            raise PermissionError("context not found")
         task_id = protocol.new_task_id()
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
@@ -661,7 +669,10 @@ class A2AAdapter(BasePlatformAdapter):
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
-        task, pending = self._prepare_task(params, peer, agent=agent)
+        try:
+            task, pending = self._prepare_task(params, peer, agent=agent)
+        except PermissionError:
+            return _err(req_id, protocol.ERR_TASK_NOT_FOUND, "context not found")
         if task is None:
             state, reply = self._finalize_task(pending, *self._await_reply(pending))
             task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
@@ -696,11 +707,13 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _rpc_message_stream(self, handler, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None) -> None:
         """message/stream as an SSE response of JSON-RPC-wrapped StreamResponse events (§9.4)."""
-        protocol.metrics.streams_started += 1
-        self._sse_headers(handler)
-        pending = None
         try:
             terminal, pending = self._prepare_task(params, peer, agent=agent)
+        except PermissionError:
+            return handler._json(200, _err(req_id, protocol.ERR_TASK_NOT_FOUND, "context not found"))
+        protocol.metrics.streams_started += 1
+        try:
+            self._sse_headers(handler)
             if terminal is not None:
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
@@ -716,14 +729,14 @@ class A2AAdapter(BasePlatformAdapter):
                 self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
             logger.debug("A2A: stream client disconnected")
 
-    def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:
+    def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> None:
         """Reconnect to an existing task's stream (v1.0 SubscribeToTask)."""
-        task_id, rec, error = self._find_task(req_id, params, agent)
+        task_id, rec, error = self._find_task(req_id, params, agent, peer)
         if error:
             return handler._json(200, error)
         self._sse_headers(handler)
         try:
-            if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent))) is None:
+            if (fut := self.tasks.watch(task_id, *self._scope_for_agent(agent), peer=self._task_owner(peer))) is None:
                 return self._sse_write(handler, protocol.sse_done())
             state, reply = self._await_future(fut, time.time() + _reply_timeout(), self._keepalive(handler),
                                               (rec["state"], rec.get("reply", "")))
@@ -731,30 +744,33 @@ class A2AAdapter(BasePlatformAdapter):
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
 
-    def _find_task(self, req_id: Any, params: dict, agent: Optional[dict]) -> tuple[str, Optional[dict], Optional[dict]]:
+    def _task_owner(self, peer: str) -> Optional[str]:
+        return peer if self._task_access == "peer" else None
+
+    def _find_task(self, req_id: Any, params: dict, agent: Optional[dict], peer: str) -> tuple[str, Optional[dict], Optional[dict]]:
         """(task_id, record, None) for a visible task, else (task_id, None, jsonrpc_error)."""
         task_id = str(params.get("taskId") or params.get("id") or "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer=self._task_owner(peer))
         return task_id, rec, None if rec else _err(req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
 
-    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
-        _task_id, rec, error = self._find_task(req_id, params, agent)
+    def _rpc_tasks_get(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
+        _task_id, rec, error = self._find_task(req_id, params, agent, peer)
         return error or _ok(req_id, protocol.TaskStore.to_task(rec))
 
-    def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_tasks_list(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
         offset = _to_int(params.get("pageToken") or 0, 0)
         page_size = _to_int(params.get("pageSize") or 50, 50)
         agent_slug, tenant = self._scope_for_agent(agent)
         recs, next_offset, total = self.tasks.list(
             context_id=str(params.get("contextId") or ""), state=str(params.get("status") or params.get("state") or ""),
-            page_size=page_size, offset=max(0, offset), agent_slug=agent_slug, tenant=tenant, with_total=True)
+            page_size=page_size, offset=max(0, offset), agent_slug=agent_slug, tenant=tenant, with_total=True, peer=self._task_owner(peer))
         include_artifacts = bool(params.get("includeArtifacts", False))
         return _ok(req_id, {"tasks": [protocol.TaskStore.to_task(r, include_artifacts=include_artifacts) for r in recs],
                             "nextPageToken": str(next_offset) if next_offset else "",
                             "pageSize": max(1, min(page_size, 100)), "totalSize": total})
 
-    def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
-        task_id, rec, error = self._find_task(req_id, params, agent)
+    def _rpc_tasks_cancel(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
+        task_id, rec, error = self._find_task(req_id, params, agent, peer)
         if error:
             return error
         if rec["state"] in protocol.TERMINAL_STATES:
@@ -762,7 +778,7 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
-        rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
+        rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer=self._task_owner(peer)) or rec
         return _ok(req_id, protocol.TaskStore.to_task(rec))
 
     def _register_inline_push(self, task_id: str, params: dict, agent: Optional[dict] = None) -> None:
@@ -772,32 +788,35 @@ class A2AAdapter(BasePlatformAdapter):
         if url:
             self.tasks.set_push_config(task_id, str(url), *self._scope_for_agent(agent))
 
-    def _rpc_push_config_create(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_create(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
         task_id = str(params.get("taskId") or "")
         url = str((params.get("pushNotificationConfig") or params.get("config") or {}).get("url") or "")
         if not task_id or not url:
             return _err(req_id, protocol.ERR_INVALID_PARAMS, "taskId and pushNotificationConfig.url required")
-        stored = self.tasks.set_push_config(task_id, url, *self._scope_for_agent(agent))
+        stored = self.tasks.set_push_config(task_id, url, *self._scope_for_agent(agent), peer=self._task_owner(peer))
         return _ok(req_id, stored) if stored is not None else _err(req_id, protocol.ERR_TASK_NOT_FOUND, f"task not found: {task_id}")
 
-    def _push_config_op(self, req_id: Any, params: dict, agent: Optional[dict], op, render) -> dict:
+    def _push_config_op(self, req_id: Any, params: dict, agent: Optional[dict], op, render, peer: str) -> dict:
         """Shared get/list/delete: ``op(task_id, config_id, slug, tenant)`` falsy => not found."""
         task_id = str(params.get("taskId") or "")
         if not task_id:
             return _err(req_id, protocol.ERR_INVALID_PARAMS, "taskId required")
-        found = op(task_id, str(params.get("id") or params.get("configId") or ""), *self._scope_for_agent(agent))
+        _, _, error = self._find_task(req_id, {"id": task_id}, agent, peer)
+        if error:
+            return error
+        found = op(task_id, str(params.get("id") or params.get("configId") or ""), *self._scope_for_agent(agent), peer=self._task_owner(peer))
         return _ok(req_id, render(found)) if found else _err(req_id, protocol.ERR_TASK_NOT_FOUND, f"push config not found for task: {task_id}")
 
-    def _rpc_push_config_get(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
-        return self._push_config_op(req_id, params, agent, self.tasks.get_push_config, lambda cfg: cfg)
+    def _rpc_push_config_get(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
+        return self._push_config_op(req_id, params, agent, self.tasks.get_push_config, lambda cfg: cfg, peer)
 
-    def _rpc_push_config_list(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
+    def _rpc_push_config_list(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
         # An empty list is a valid (non-error) result, hence the ``or [[]]`` sentinel through the shared op.
-        return self._push_config_op(req_id, params, agent, lambda tid, _cid, *scope: self.tasks.list_push_configs(tid, *scope) or [[]],
-                                    lambda found: {"configs": [c for c in found if c], "nextPageToken": ""})
+        return self._push_config_op(req_id, params, agent, lambda tid, _cid, *scope, **kwargs: self.tasks.list_push_configs(tid, *scope, **kwargs) or [[]],
+                                    lambda found: {"configs": [c for c in found if c], "nextPageToken": ""}, peer)
 
-    def _rpc_push_config_delete(self, req_id: Any, params: dict, agent: Optional[dict] = None) -> dict:
-        return self._push_config_op(req_id, params, agent, self.tasks.delete_push_config, lambda _: {"deleted": True})
+    def _rpc_push_config_delete(self, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> dict:
+        return self._push_config_op(req_id, params, agent, self.tasks.delete_push_config, lambda _: {"deleted": True}, peer)
 
     def _send_push_notification(self, task_id: str, context_id: str, reply: str, state: str) -> None:
         """POST a v1.0 StreamResponse payload to the task's registered callback (SSRF-checked URL)."""
