@@ -582,7 +582,8 @@ class TestTaskStore:
         assert result == [(protocol.STATE_COMPLETED, "reply")]
         assert adapter.tasks.get("t-live")["state"] == protocol.STATE_COMPLETED
 
-    def test_stream_disconnect_releases_active_request(self, monkeypatch):
+    @pytest.mark.parametrize("disconnect_at", ["headers", "body"])
+    def test_stream_disconnect_releases_active_request(self, monkeypatch, disconnect_at):
         adapter, _base = _make_live_adapter(monkeypatch)
         rec = adapter.tasks.create("t-live", "c1", "peer")
         adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
@@ -607,7 +608,8 @@ class TestTaskStore:
                 pass
 
             def end_headers(self):
-                pass
+                if disconnect_at == "headers":
+                    raise BrokenPipeError
 
         adapter._rpc_message_stream(Handler(), 1, {}, "peer")
 
