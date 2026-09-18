@@ -583,7 +583,7 @@ class TestTaskStore:
         assert adapter.tasks.get("t-live")["state"] == protocol.STATE_COMPLETED
 
     @pytest.mark.parametrize("disconnect_at", ["headers", "body"])
-    def test_stream_disconnect_releases_active_request(self, monkeypatch, disconnect_at):
+    def test_stream_disconnect_keeps_execution_owned(self, monkeypatch, disconnect_at):
         adapter, _base = _make_live_adapter(monkeypatch)
         rec = adapter.tasks.create("t-live", "c1", "peer")
         adapter.tasks.set_state("t-live", protocol.STATE_WORKING)
@@ -614,10 +614,10 @@ class TestTaskStore:
         adapter._rpc_message_stream(Handler(), 1, {}, "peer")
 
         stored = adapter.tasks.get("t-live")
-        assert stored["state"] == protocol.STATE_FAILED
-        assert stored["reply"] == "[client disconnected]"
-        assert "t-live" not in adapter._pending
-        assert "t-live" not in adapter._active_tasks
+        assert stored["state"] == protocol.STATE_WORKING
+        assert stored["reply"] == ""
+        assert "t-live" in adapter._pending
+        assert "t-live" in adapter._active_tasks
 
     def test_list_newest_first_with_filters(self):
         store = protocol.TaskStore()

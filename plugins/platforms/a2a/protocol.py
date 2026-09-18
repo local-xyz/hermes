@@ -293,15 +293,40 @@ metrics = Metrics()
 
 
 class TaskStore:
-    """In-memory A2A tasks, kept after completion for tasks/get. Records carry agent slug +
-    tenant and peer; HTTP readers pass an explicit scope. None is internal unrestricted access."""
+    """A2A task records, optionally durable for a single gateway owning ``path``.
+
+    Startup fails unfinished work explicitly; it never replays execution. Retains the latest
+    500 terminal records. HTTP readers supply a scope; None is internal unrestricted access.
+    """
 
     _MAX_TERMINAL = 500
 
-    def __init__(self) -> None:
+    def __init__(self, path: Optional[Path] = None) -> None:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        self._path = path
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.closing(sqlite3.connect(path, timeout=5)) as db, db:
+                db.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, record TEXT NOT NULL)")
+                for task_id, raw in db.execute("SELECT id, record FROM tasks ORDER BY rowid"):
+                    self._tasks[task_id] = json.loads(raw)
+            for task_id, rec in list(self._tasks.items()):
+                if rec["state"] not in TERMINAL_STATES:
+                    self.complete(task_id, STATE_FAILED,
+                                  "[gateway restarted before completion; execution was interrupted; explicitly retry with a new request]")
+
+    def _put_locked(self, rec: dict) -> None:
+        """Commit before publishing in memory or waking observers. Caller holds the lock."""
+        previous = self._tasks.get(rec["task_id"])
+        if previous is None or (previous["state"], previous["reply"]) != (rec["state"], rec["reply"]):
+            rec["task"] = build_task(rec["task_id"], rec["context_id"], rec["state"], rec["reply"])
+        if self._path is not None:
+            with contextlib.closing(sqlite3.connect(self._path, timeout=5)) as db, db:
+                db.execute("INSERT INTO tasks VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+                           (rec["task_id"], json.dumps(rec)))
+        self._tasks[rec["task_id"]] = rec
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: Optional[str] = None, tenant: Optional[str] = None, peer: Optional[str] = None) -> bool:
@@ -330,20 +355,23 @@ class TaskStore:
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
                "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
-            self._tasks[task_id] = rec
+            if task_id in self._tasks:
+                raise ValueError("task already exists")
+            self._put_locked(rec)
         return dict(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
         with self._lock:
             if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
-                rec["state"] = state
+                self._put_locked({**rec, "state": state})
 
     def set_push_config(self, task_id: str, url: str, agent_slug: Optional[str] = None, tenant: Optional[str] = None, peer: Optional[str] = None) -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
         with self._lock:
             if not (rec := self._scoped(task_id, agent_slug, tenant, peer)):
                 return None
-            rec["push_url"], rec["push_config_id"] = url, "cfg-" + uuid.uuid4().hex[:12]
+            rec = {**rec, "push_url": url, "push_config_id": "cfg-" + uuid.uuid4().hex[:12]}
+            self._put_locked(rec)
             return self._push_config_view(rec)
 
     def get_push_config(self, task_id: str, config_id: str = "", agent_slug: Optional[str] = None, tenant: Optional[str] = None, peer: Optional[str] = None) -> Optional[dict]:
@@ -358,14 +386,15 @@ class TaskStore:
         with self._lock:
             rec = self._push_rec(task_id, config_id, agent_slug, tenant, peer)
             if rec:
-                rec["push_url"] = rec["push_config_id"] = ""
+                self._put_locked({**rec, "push_url": "", "push_config_id": ""})
             return rec is not None
 
     def pop_push_url(self, task_id: str) -> str:
         with self._lock:
             rec = self._tasks.get(task_id)
             if rec:
-                url, rec["push_url"] = rec["push_url"], ""
+                url = rec["push_url"]
+                self._put_locked({**rec, "push_url": ""})
             return url if rec else ""
 
     def get(self, task_id: str, agent_slug: Optional[str] = None, tenant: Optional[str] = None, peer: Optional[str] = None) -> Optional[dict]:
@@ -378,7 +407,8 @@ class TaskStore:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
                 return None
-            rec.update(state=state, reply=reply, completed_at=time.time())
+            rec = {**rec, "state": state, "reply": reply, "completed_at": time.time()}
+            self._put_locked(rec)
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
             out = dict(rec)
@@ -423,13 +453,17 @@ class TaskStore:
     def _trim_locked(self) -> None:
         terminal = [tid for tid, rec in self._tasks.items() if rec["state"] in TERMINAL_STATES]
         for tid in terminal[:max(0, len(terminal) - self._MAX_TERMINAL)]:
+            if self._path is not None:
+                with contextlib.closing(sqlite3.connect(self._path, timeout=5)) as db, db:
+                    db.execute("DELETE FROM tasks WHERE id = ?", (tid,))
             self._tasks.pop(tid, None)
 
     @staticmethod
     def to_task(rec: dict, include_artifacts: bool = True) -> dict:
         """Render a stored record as an A2A v1.0 Task."""
-        task = build_task(rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", ""),
-                          created_at=rec.get("created_iso", ""))
+        from copy import deepcopy
+        task = deepcopy(rec["task"]) if "task" in rec else build_task(
+            rec["task_id"], rec["context_id"], rec["state"], rec.get("reply", ""))
         if not include_artifacts:
             task.pop("artifacts", None)
         return task

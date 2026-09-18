@@ -69,9 +69,18 @@ platforms:
 `peer` requires `A2A_PEER_TOKENS` and rejects a shared `A2A_BEARER_TOKEN`.
 Only the initiating peer can access a task, its notifications, or its context.
 Rotating a token while keeping the peer name preserves ownership. Context owners
-persist in `a2a_contexts.db`; task records still disappear on restart. Existing
+persist in `a2a_contexts.db`; task outcomes persist in `a2a_tasks.db`. Existing
 transcripts without an owner binding remain locally readable but require a new
 context for remote work. Changing to `shared` explicitly removes peer isolation.
+
+The gateway retains the latest 500 terminal task records. After a restart,
+unfinished tasks become failed with an interruption message; retry requires a new
+request. Execution is never automatically replayed. One gateway owns each profile's
+task database. Tasks sharing a conversation run sequentially; independent contexts
+can run concurrently. Losing an HTTP stream does not cancel execution: use
+`GetTask` or `SubscribeToTask` to reconnect. `CancelTask` interrupts local gateway
+execution; synchronous forwarded-profile tasks return not-cancelable. Cancellation
+does not undo tool side effects already performed. Push callbacks remain best-effort.
 
 Configured outbound peers may supply additional HTTP headers for a proxy:
 

@@ -29,6 +29,7 @@ from gateway.config import Platform
 from gateway.platforms._shared import coerce_port as _to_int, get_scoped_secret as _get_scoped_secret
 
 from . import protocol, security
+from .execution import A2AExecution
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +258,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent, peer=identity))
 
 
-class A2AAdapter(BasePlatformAdapter):
+class A2AAdapter(A2AExecution, BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
     def __init__(self, config, **kwargs):
@@ -291,8 +292,11 @@ class A2AAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._watchdog_stop = threading.Event()
         # Per-adapter protocol state (not module-global).
-        self.tasks, self._turns, self._rate_limiter = protocol.TaskStore(), protocol.TurnTracker(), protocol.RateLimiter()
         self._context_owners = protocol.ContextOwners()
+        self.tasks = protocol.TaskStore()
+        self._turns, self._rate_limiter = protocol.TurnTracker(), protocol.RateLimiter()
+        self._executions: dict[str, tuple[str, asyncio.Task]] = {}
+        self._execution_locks: dict[str, asyncio.Lock] = {}
         # Forwarded profile sessions: (profile, agent_slug, context_id) -> session_id.
         self._profile_sessions: Dict[tuple[str, str, str], str] = {}
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
@@ -322,11 +326,26 @@ class A2AAdapter(BasePlatformAdapter):
     async def connect(self, **_kwargs) -> bool:
         # Capture the gateway loop so the HTTP thread can marshal events via run_coroutine_threadsafe.
         self._loop = asyncio.get_running_loop()
+        if self._httpd is not None:
+            return True
+        if not self._acquire_platform_lock("a2a-tasks", str(self._context_owners.home.resolve()), "A2A task database"):
+            return False
         try:
             self._httpd = ThreadingHTTPServer((self.host, self.port), A2ARequestHandler)
         except OSError as e:
+            self._release_platform_lock()
             logger.error("A2A: could not bind %s:%s — %s", self.host, self.port, e)
             self._set_fatal_error("bind_failed", f"A2A bind failed: {e}", retryable=True)
+            return False
+        try:
+            # Recover only after acquiring the owning gateway's lock and listener.
+            self.tasks = protocol.TaskStore(self._context_owners.home / "a2a_tasks.db")
+        except Exception:
+            self._httpd.server_close()
+            self._httpd = None
+            self._release_platform_lock()
+            logger.exception("A2A: task database recovery failed")
+            self._set_fatal_error("task_store_failed", "A2A task database recovery failed", retryable=False)
             return False
         self._httpd.daemon_threads = True
         self._httpd.adapter = self  # type: ignore[attr-defined]
@@ -342,6 +361,7 @@ class A2AAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._mark_disconnected()
         self._watchdog_stop.set()
+        await self._stop_executions()
         if self._httpd is not None:
             with contextlib.suppress(Exception):
                 self._httpd.shutdown()
@@ -354,6 +374,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending.clear()
             self._pending_order.clear()
             self._active_tasks.clear()
+        self._release_platform_lock()
 
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
@@ -563,13 +584,15 @@ class A2AAdapter(BasePlatformAdapter):
                 return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
             finally:
                 self._pop_pending(task_id)
-        if self._loop is None or self._message_handler is None:
+        if self._loop is None or self._message_handler is None or self._watchdog_stop.is_set():
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
-        fut = self._add_pending(task_id, context_id)
+        self._add_pending(task_id, context_id)
+        pending = {"task_id": task_id, "context_id": context_id, "peer": peer,
+                   "future": self.tasks.watch(task_id), "created_iso": rec["created_iso"], "started": time.time()}
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+            asyncio.run_coroutine_threadsafe(self._execute_task(event, pending), self._loop)
         except Exception as e:
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             try:
@@ -577,7 +600,7 @@ class A2AAdapter(BasePlatformAdapter):
             finally:
                 self._pop_pending(task_id)
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
+        return None, pending
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed task to another local profile via ``hermes chat``. First contact creates a
@@ -620,6 +643,8 @@ class A2AAdapter(BasePlatformAdapter):
     def _record_outcome(self, task_id: str, context_id: str, peer: str, state: str, reply: str,
                         started: Optional[float] = None) -> None:
         """Persist + audit + count a finished task, mark it terminal, and fire its push callback."""
+        if self.tasks.complete(task_id, state, reply) is None:
+            return
         protocol.persist_message(context_id, "agent", reply, task_id)
         security.audit("outbound", peer, task_id, reply)
         m = protocol.metrics
@@ -629,7 +654,6 @@ class A2AAdapter(BasePlatformAdapter):
                 m.record_latency(time.time() - started)
         else:
             m.tasks_failed += 1
-        self.tasks.complete(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
@@ -642,7 +666,8 @@ class A2AAdapter(BasePlatformAdapter):
             if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
                 state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
             self._record_outcome(task_id, context_id, peer, state, reply, started=pending["started"])
-            return state, reply
+            rec = self.tasks.get(task_id)
+            return (rec["state"], rec["reply"]) if rec else (state, reply)
         finally:
             self._pop_pending(task_id)
 
@@ -674,8 +699,8 @@ class A2AAdapter(BasePlatformAdapter):
         except PermissionError:
             return _err(req_id, protocol.ERR_TASK_NOT_FOUND, "context not found")
         if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            self._await_reply(pending)
+            task = protocol.TaskStore.to_task(self.tasks.get(pending["task_id"]))
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -701,6 +726,12 @@ class A2AAdapter(BasePlatformAdapter):
         completed = bool(reply) and state == protocol.STATE_COMPLETED
         events = ([protocol.artifact_update(task_id, context_id, reply)] if completed else []) + [
             protocol.status_update(task_id, context_id, state, "" if completed else reply)]
+        rec = self.tasks.get(task_id)
+        if rec is not None and rec["state"] == state:
+            task = protocol.TaskStore.to_task(rec)
+            events[-1]["statusUpdate"]["status"] = task["status"]
+            if completed:
+                events[0]["artifactUpdate"]["artifact"] = task["artifacts"][0]
         for ev in events:
             self._sse_write(handler, protocol.sse_data(ev, req_id))
         self._sse_write(handler, protocol.sse_done())
@@ -721,12 +752,12 @@ class A2AAdapter(BasePlatformAdapter):
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
-            state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
+            self._await_reply(pending, keepalive=self._keepalive(handler))
+            rec = self.tasks.get(task_id)
+            state, reply = rec["state"], rec["reply"]
             pending = None
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
-            if pending is not None:
-                self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
             logger.debug("A2A: stream client disconnected")
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None, *, peer: str) -> None:
@@ -775,10 +806,23 @@ class A2AAdapter(BasePlatformAdapter):
             return error
         if rec["state"] in protocol.TERMINAL_STATES:
             return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, f"task {task_id} already {rec['state']}")
-        self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+        # Profile forwards run in a separate synchronous child and have no stop handle.
+        # Do not claim cancellation when execution cannot be interrupted.
+        if agent and not agent.get("local", True):
+            return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, "forwarded profile task cannot be canceled")
+        if self._loop is not None:
+            stopped = asyncio.run_coroutine_threadsafe(self._cancel_execution(task_id), self._loop)
+            try:
+                stopped.result(timeout=15)
+            except Exception:
+                return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, "task cancellation has not completed; query task status")
+        else:
+            self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent), peer=self._task_owner(peer)) or rec
+        if rec["state"] != protocol.STATE_CANCELED:
+            return _err(req_id, protocol.ERR_TASK_NOT_CANCELABLE, f"task {task_id} already {rec['state']}")
         return _ok(req_id, protocol.TaskStore.to_task(rec))
 
     def _register_inline_push(self, task_id: str, params: dict, agent: Optional[dict] = None) -> None:
