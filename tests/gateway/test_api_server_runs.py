@@ -2277,6 +2277,37 @@ class TestHostedRoomRuns:
                     await asyncio.sleep(0.05)
             assert status.status == 200
             assert status_body["output"] == "Scoped room reply."
+            # The event stream has the same scoped read authority as run status.
+            invalid = await cli.get(
+                f"/v1/runs/{run_id}/events",
+                headers={"Authorization": "HermesRoom invalid"},
+            )
+            assert invalid.status == 401
+            other_invitation = await cli.post(
+                "/v1/room-members/invitations",
+                json={
+                    "room_id": "other-room", "home_install_id": "other-home",
+                    "authority_gateway_id": "other-home", "authority_epoch": 1,
+                    "member_id": "other-member", "grant_id": "other-grant",
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert other_invitation.status == 201
+            other_grant = (await other_invitation.json())["grant"]
+            foreign = await cli.get(
+                f"/v1/runs/{run_id}/events",
+                headers={"Authorization": f"HermesRoom {other_grant}"},
+            )
+            assert foreign.status == 404
+            async with asyncio.timeout(5):
+                events = await cli.get(
+                    f"/v1/runs/{run_id}/events",
+                    headers={"Authorization": f"HermesRoom {grant}"},
+                )
+                assert events.status == 200
+                event_text = await events.text()
+            assert '"event": "run.completed"' in event_text
+            assert "Scoped room reply." in event_text
             session_id = status_body["session_id"]
             db = await adapter._ensure_session_db_async()
             row = db.get_session(session_id)
